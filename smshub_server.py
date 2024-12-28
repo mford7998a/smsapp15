@@ -225,37 +225,27 @@ class SmsHubServer:
     def handle_finish_activation(self, data):
         """Handle FINISH_ACTIVATION request."""
         try:
-            # Validate required fields
             activation_id = data.get('activationId')
             status = data.get('status')
-
-            if not isinstance(activation_id, (int, float)) or not isinstance(status, (int, float)):
+            
+            if not activation_id or status is None:
                 return jsonify({
                     'status': 'ERROR',
-                    'error': 'Invalid field types'
+                    'error': 'Missing required fields'
                 })
-
-            # Find the activation by ID
-            port = None
+            
+            # Find the activation
             phone = None
-            # First check active numbers
-            for p_num, activation in self.active_numbers.items():
-                if activation.get('activation_id') == activation_id:
-                    phone = p_num
-                    port = activation.get('port')
+            port = None
+            activation = None
+            
+            for num, details in self.active_numbers.items():
+                if details.get('activation_id') == activation_id:
+                    phone = num
+                    activation = details
+                    port = details.get('port')
                     break
-
-            # If not found in active numbers, check completed activations
-            if not phone:
-                for p_num, services in self.completed_activations.items():
-                    if any(s.get('activation_id') == activation_id for s in services.values()):
-                        return jsonify({'status': 'SUCCESS'})  # Already completed
-                return jsonify({
-                    'status': 'ERROR',
-                    'error': 'Activation not found'
-                })
-
-            activation = self.active_numbers.get(phone)
+                    
             if not activation:
                 # If no active activation but phone exists, it was likely already completed
                 return jsonify({'status': 'SUCCESS'})
@@ -264,9 +254,23 @@ class SmsHubServer:
             self.log_activation_status(activation_id, status, phone)
 
             # Update activation status based on status code
-            if status == 1:  # Waiting for SMS
-                logger.info(f"Activation {activation_id} waiting for SMS")
-                # No action needed, just keep waiting
+            if status == 1:  # Service blocked for this number
+                logger.info(f"Service blocked: {phone} - {activation['service']}")
+                # Add to blocked services
+                self.activation_history.add_blocked_service(phone, activation['service'])
+                
+                # Update service stats
+                service = activation['service']
+                if service not in self.stats['service_stats']:
+                    self.stats['service_stats'][service] = {'completed': 0, 'cancelled': 0, 'refunded': 0, 'blocked': 0}
+                self.stats['service_stats'][service]['blocked'] += 1
+                
+                # Clean up
+                self.active_numbers.pop(phone, None)
+                if port and port in self.modems:
+                    self.modems[port]['status'] = 'active'
+                    self.modems[port].pop('activation_id', None)
+                    
             elif status == 3:  # Successfully completed
                 self.save_activation(phone, activation['service'], 'completed')
                 self.stats['completed_activations'] += 1
@@ -276,7 +280,7 @@ class SmsHubServer:
                 # Update service stats
                 service = activation['service']
                 if service not in self.stats['service_stats']:
-                    self.stats['service_stats'][service] = {'completed': 0, 'cancelled': 0, 'refunded': 0}
+                    self.stats['service_stats'][service] = {'completed': 0, 'cancelled': 0, 'refunded': 0, 'blocked': 0}
                 self.stats['service_stats'][service]['completed'] += 1
                 
                 # Calculate and store activation time
@@ -296,7 +300,7 @@ class SmsHubServer:
                 # Update service stats
                 service = activation['service']
                 if service not in self.stats['service_stats']:
-                    self.stats['service_stats'][service] = {'completed': 0, 'cancelled': 0, 'refunded': 0}
+                    self.stats['service_stats'][service] = {'completed': 0, 'cancelled': 0, 'refunded': 0, 'blocked': 0}
                 self.stats['service_stats'][service]['cancelled'] += 1
                 
                 # Clean up
@@ -312,7 +316,7 @@ class SmsHubServer:
                 # Update service stats
                 service = activation['service']
                 if service not in self.stats['service_stats']:
-                    self.stats['service_stats'][service] = {'completed': 0, 'cancelled': 0, 'refunded': 0}
+                    self.stats['service_stats'][service] = {'completed': 0, 'cancelled': 0, 'refunded': 0, 'blocked': 0}
                 self.stats['service_stats'][service]['refunded'] += 1
                 
                 # Clean up
@@ -488,22 +492,38 @@ class SmsHubServer:
     def get_service_quantities(self):
         """Get current quantities for all services."""
         try:
-            # Count active modems
+            # Get active modems count
             active_modems = len([m for m in self.modems.values() 
                                if m.get('status') == 'active'])
             
-            # Return quantities for enabled services
-            return {
-                service: {
-                    'quantity': active_modems,
+            # Get service quantities considering blocks and activation limits
+            quantities = {}
+            for service, enabled in config.get('services', {}).items():
+                if not enabled:
+                    continue
+                    
+                # Count available phones for this service
+                available_count = 0
+                for modem in self.modems.values():
+                    if modem.get('status') != 'active':
+                        continue
+                    phone = modem.get('phone')
+                    if not phone:
+                        continue
+                    # Check if service is available for this phone
+                    if self.activation_history.is_service_available(phone, service):
+                        available_count += 1
+                
+                quantities[service] = {
+                    'quantity': available_count,
                     'active': len([1 for num in self.active_numbers.values() 
                                  if num.get('service') == service]),
                     'completed': len([1 for nums in self.completed_activations.values() 
                                     if service in nums])
                 }
-                for service, enabled in config.get('services', {}).items()
-                if enabled
-            }
+            
+            return quantities
+            
         except Exception as e:
             logger.error(f"Error getting service quantities: {e}")
             return {}
